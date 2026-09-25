@@ -7,6 +7,8 @@
  */
 
 import { DEFAULT_REVIEW_GUIDANCE } from '@propr/shared';
+import { assemblePRDiff, type PreparedPRDiff } from './prDiffFormatting.js';
+import { ReviewTokenEstimator } from './reviewTokenEstimator.js';
 
 export interface ReviewPromptOptions {
     pullRequestNumber: number;
@@ -138,7 +140,10 @@ Before writing the response, silently perform a PR-scoped validation pass:
 2. Trace the changed control and data paths through their relevant callers and consumers. Check boundary inputs, failure propagation, resource or security boundaries, and empty, singleton, and limit cases when those cases apply to the changed logic.
 3. Test each potential finding against the current diff. Passing tests or extensive coverage are evidence, not proof that changed behavior is correct.
 4. For each candidate blocker, build the concrete failure sequence required below. A candidate you cannot drive from a reachable trigger to an observable incorrect outcome is not a blocker.
-5. Classify only PR-introduced merge requirements as F# findings. Keep pre-existing problems, optional hardening, and adjacent redesigns as S# suggestions.
+5. Derive the key correctness invariants of the changed behavior and trace each across relevant entry points, state transitions, recovery paths, and cleanup. Check applicable success, refusal, timeout, access-loss, retry, crash, and takeover paths; do not invent scenarios merely to fill this list.
+6. For every verified defect, inspect sibling implementations and callers for the same invalid assumption before publishing. For asynchronous stateful code, examine what can change across awaited operations, which authority permits subsequent mutations, and what evidence permits durable obligations to be released. Verify the actual protections instead of assuming that an await loses ownership.
+7. Do not stop after the first verified blocker. Complete this related-path audit and report all verified blockers found, without a finding-count limit or quota. Group occurrences that share a root cause and correction, citing every verified affected location; keep independently actionable defects separate. If a material path could not be checked, state that limitation rather than implying exhaustive coverage.
+8. Classify only PR-introduced merge requirements as F# findings. Keep pre-existing problems, optional hardening, and adjacent redesigns as S# suggestions. Related-path inspection does not expand the original review boundary or turn speculative external races into blockers.
 
 Do not print this validation pass or turn it into a generic checklist. Report only verified results in the four required sections.
 
@@ -176,7 +181,7 @@ For a concurrency, race, or interleaving finding, also name the awaited operatio
 
 State inside the evidence line any assumption you could not verify. A failure that depends on an unverified assumption, is unreachable from any caller, or has no material consequence is speculative hardening and belongs in Suggestions and Follow-ups.
 
-Judge minimumCorrection against the demonstrated sequence: it must close that specific failure and nothing wider. Do not demand atomicity that independent external systems cannot provide — when two independent external APIs cannot be updated as one transaction, separate the avoidable window this PR can close from the residual external race it cannot. That distinction never excuses a practical fencing token, ownership check, or reconciliation step that would have prevented the demonstrated failure.
+Judge minimumCorrection against the demonstrated sequence: it must close the demonstrated failure, including verified sibling occurrences of the same root cause, without unrelated redesign. Do not demand atomicity that independent external systems cannot provide — when two independent external APIs cannot be updated as one transaction, separate the avoidable window this PR can close from the residual external race it cannot. That distinction never excuses a practical fencing token, ownership check, or reconciliation step that would have prevented the demonstrated failure.
 
 Every field is mandatory. If you cannot truthfully supply every field, the item is not actionable and belongs in Suggestions and Follow-ups. A PR-introduced correctness, security, data-loss, or contract regression must not be demoted to a suggestion merely because it was absent from the original task wording. Do not use a broad redesign as the correction when a localized fix can make the current PR correct. If there are no actionable findings, write \`No actionable findings.\`
 
@@ -208,24 +213,183 @@ Do NOT modify any files. This is a read-only review.`;
     return prompt;
 }
 
-const TRUNCATION_MARKER = '\n\n[Context truncated to fit the configured PR review token limit.]';
-const PR_DIFF_TRUNCATION_MARKER = '\n\n[PR diff truncated to fit the configured PR review token limit. Files or diff ranges were omitted by the review budget, so this review is partial.]';
+const TRUNCATION_MARKER = '\n\n[Context truncated to fit the PR review context budget.]';
+const PR_DIFF_TRUNCATION_MARKER = '\n\n[PR diff truncated to fit the PR review context budget. Files or diff ranges were omitted by the review budget, so this review is partial.]';
 
-function estimateReviewPromptTokens(prompt: string): number {
-    // Reviewer tokenizers may disagree substantially on non-ASCII text. The
-    // UTF-8 byte count is a tokenizer-independent upper bound for the raw
-    // request: even a byte-fallback tokenizer cannot emit more text tokens
-    // than there are input bytes. This intentionally favors a guaranteed
-    // ceiling over the extra capacity of an average characters/token ratio.
-    return Buffer.byteLength(prompt, 'utf8');
+type TrimmableKey = 'relatedContext' | 'commentHistory' | 'fileContents' | 'prDiff' | 'originalTaskSpec'
+    | 'combinedCommentBody' | 'instructions' | 'reviewPromptOverride';
+
+/**
+ * Trimming order. Redundant context (scout excerpts, comment history, copies of
+ * whole changed files) goes first; the changed-code diff next; the objective,
+ * review request and operator instructions only once everything else is gone.
+ */
+const TRIM_ORDER: ReadonlyArray<readonly [TrimmableKey, string]> = [
+    ['relatedContext', 'related unchanged context'],
+    ['commentHistory', 'comment history'],
+    ['fileContents', 'changed file contents'],
+    ['prDiff', 'PR diff'],
+    ['originalTaskSpec', 'original PR objective'],
+    ['combinedCommentBody', 'review request'],
+    ['instructions', 'additional review instructions'],
+    ['reviewPromptOverride', 'review prompt override'],
+];
+
+// Slack per assembled section for tokenizer merges across section boundaries.
+const SECTION_BOUNDARY_SLACK_TOKENS = 4;
+const MAX_FIT_ATTEMPTS = 4;
+
+export interface ReviewPromptBudgetOptions {
+    /**
+     * Untrimmed diff shared by all reviewers. When supplied, whole files are
+     * selected in review-priority order to fit this reviewer's budget and
+     * `options.prDiff` is ignored.
+     */
+    preparedDiff?: PreparedPRDiff;
+    /** Token estimator for the routed reviewer. Defaults to the most conservative profile. */
+    estimator?: ReviewTokenEstimator;
+}
+
+export interface ReviewPromptSectionTrim {
+    section: string;
+    originalTokens: number;
+    keptTokens: number;
+}
+
+export interface ReviewPromptBudgetResult {
+    prompt: string;
+    /** Estimated tokens of the prompt plus the analysis runtime suffix. */
+    estimatedTokens: number;
+    truncatedSections: string[];
+    trimmedSections: ReviewPromptSectionTrim[];
+    /** Estimated tokens per section in the final prompt ('scaffold' is the fixed instructions). */
+    sectionTokens: Record<string, number>;
+    prDiffTruncated: boolean;
+    /** Diff files with patch content that did not fit this reviewer's budget. */
+    budgetOmittedFiles: string[];
+    /** Diff files GitHub returned without patch content. */
+    missingPatchFiles: string[];
+    /** Diff files dropped by the diff size I/O guard. */
+    ioGuardOmittedFiles: string[];
+}
+
+interface BudgetSelection {
+    mutable: ReviewPromptOptions;
+    trimmedSections: ReviewPromptSectionTrim[];
+    prDiffTruncated: boolean;
+    budgetOmittedFiles: string[];
+    sectionTokens: Record<string, number>;
+    trimmableRemaining: boolean;
+}
+
+interface SelectionInputs {
+    options: ReviewPromptOptions;
+    analysisPromptSuffix: string;
+    estimator: ReviewTokenEstimator;
+    preparedDiff?: PreparedPRDiff;
+}
+
+/** Whole diff files, in review-priority order, whose estimated cost fits `allowance`. */
+function selectDiffFiles(
+    preparedDiff: PreparedPRDiff,
+    allowance: number,
+    estimator: ReviewTokenEstimator,
+): { diff: string; budgetOmittedFiles: string[] } {
+    const selected = new Set<string>();
+    // Upper bound for the summary and omission note: every file omitted.
+    let used = estimator.estimate(assemblePRDiff(preparedDiff, selected).diff, { cache: false });
+    if (used > allowance) {
+        return { diff: PR_DIFF_TRUNCATION_MARKER, budgetOmittedFiles: preparedDiff.files.map(file => file.filename) };
+    }
+    for (const file of preparedDiff.files) {
+        const cost = estimator.estimate(file.section) + SECTION_BOUNDARY_SLACK_TOKENS;
+        if (used + cost > allowance) continue;
+        selected.add(file.filename);
+        used += cost;
+    }
+    const assembled = assemblePRDiff(preparedDiff, selected);
+    return { diff: assembled.diff, budgetOmittedFiles: assembled.budgetOmittedFiles };
+}
+
+/** Longest chunk-aligned prefix of a text section that fits, with a truncation marker. */
+function trimTextSection(key: TrimmableKey, current: string, allowance: number, estimator: ReviewTokenEstimator): string {
+    const marker = key === 'prDiff' ? PR_DIFF_TRUNCATION_MARKER : TRUNCATION_MARKER;
+    const prefixLength = allowance > 0 ? estimator.fitPrefixLength(current, allowance - estimator.estimate(marker)) : 0;
+    if (prefixLength > 0) return `${current.slice(0, prefixLength)}${marker}`;
+    return key === 'prDiff' ? PR_DIFF_TRUNCATION_MARKER : '';
+}
+
+function selectWithinBudget(inputs: SelectionInputs, target: number): BudgetSelection {
+    const { options, analysisPromptSuffix, estimator, preparedDiff } = inputs;
+    const mutable: ReviewPromptOptions = { ...options };
+    if (preparedDiff) mutable.prDiff = assemblePRDiff(preparedDiff, new Set(preparedDiff.files.map(file => file.filename))).diff;
+
+    const emptied: ReviewPromptOptions = { ...mutable };
+    for (const [key] of TRIM_ORDER) emptied[key] = '';
+    const scaffoldTokens = estimator.estimate(`${buildReviewPrompt(emptied)}${analysisPromptSuffix}`, { cache: false });
+    const wrappers = new Map<TrimmableKey, number>();
+    const wrapperTokens = (key: TrimmableKey): number => {
+        if (!wrappers.has(key)) {
+            const withSection = estimator.estimate(`${buildReviewPrompt({ ...emptied, [key]: '.' })}${analysisPromptSuffix}`, { cache: false });
+            wrappers.set(key, Math.max(0, withSection - scaffoldTokens) + SECTION_BOUNDARY_SLACK_TOKENS);
+        }
+        return wrappers.get(key)!;
+    };
+    const sectionCost = (key: TrimmableKey, value: string | undefined): number =>
+        value ? wrapperTokens(key) + estimator.estimate(value) : 0;
+
+    let total = scaffoldTokens;
+    for (const [key] of TRIM_ORDER) total += sectionCost(key, mutable[key]);
+
+    const trimmedSections: ReviewPromptSectionTrim[] = [];
+    let budgetOmittedFiles: string[] = [];
+
+    for (const [key, label] of TRIM_ORDER) {
+        const current = mutable[key];
+        if (total <= target || !current) continue;
+        const currentCost = sectionCost(key, current);
+        const allowance = currentCost - (total - target) - wrapperTokens(key);
+        let next: string;
+        if (key === 'prDiff' && preparedDiff) {
+            ({ diff: next, budgetOmittedFiles } = selectDiffFiles(preparedDiff, allowance, estimator));
+        } else {
+            next = trimTextSection(key, current, allowance, estimator);
+        }
+
+        mutable[key] = next;
+        total += sectionCost(key, next) - currentCost;
+        trimmedSections.push({
+            section: label,
+            originalTokens: estimator.estimate(current),
+            keptTokens: next ? estimator.estimate(next) : 0,
+        });
+    }
+
+    const sectionTokens: Record<string, number> = { scaffold: scaffoldTokens };
+    for (const [key] of TRIM_ORDER) {
+        if (mutable[key]) sectionTokens[key] = estimator.estimate(mutable[key]!);
+    }
+    const trimmableRemaining = TRIM_ORDER.some(([key]) => !!mutable[key] && mutable[key] !== PR_DIFF_TRUNCATION_MARKER);
+    return {
+        mutable,
+        trimmedSections,
+        prDiffTruncated: trimmedSections.some(trim => trim.section === 'PR diff'),
+        budgetOmittedFiles,
+        sectionTokens,
+        trimmableRemaining,
+    };
 }
 
 /**
- * Fit the complete review request within the configured input ceiling,
+ * Fit the complete review request within the reviewer's input ceiling,
  * including any suffix appended by the analysis runtime. The output contract
  * is always preserved. Optional scout excerpts are reduced first, then
  * historical comments, changed-file copies, and the diff. Scope and request
  * text are protected until those bulk context sections are gone.
+ *
+ * Section costs are estimated additively; the assembled request is then
+ * measured as a whole and, if boundary effects push it over, re-fitted to a
+ * lower target. An over-limit request is never returned.
  *
  * @throws when the ceiling cannot hold the mandatory instruction scaffolding
  * even after every trimmable section is removed. The scaffolding is not
@@ -236,66 +400,40 @@ export function buildReviewPromptWithinBudget(
     options: ReviewPromptOptions,
     maxContextTokens: number,
     analysisPromptSuffix = '',
-): { prompt: string; estimatedTokens: number; truncatedSections: string[]; prDiffTruncated: boolean } {
-    const mutable: ReviewPromptOptions = { ...options };
-    const truncatedSections: string[] = [];
-    let prDiffTruncated = false;
-    let prompt = buildReviewPrompt(mutable);
+    budgetOptions: ReviewPromptBudgetOptions = {},
+): ReviewPromptBudgetResult {
+    const estimator = budgetOptions.estimator ?? new ReviewTokenEstimator('generic-calibrated');
+    const { preparedDiff } = budgetOptions;
+    let target = maxContextTokens;
+    let estimatedTokens = 0;
 
-    for (const [key, label] of [
-        ['relatedContext', 'related unchanged context'],
-        ['commentHistory', 'comment history'],
-        ['fileContents', 'changed file contents'],
-        ['prDiff', 'PR diff'],
-        ['originalTaskSpec', 'original PR objective'],
-        ['combinedCommentBody', 'review request'],
-        ['instructions', 'additional review instructions'],
-        ['reviewPromptOverride', 'review prompt override'],
-    ] as const) {
-        const current = mutable[key];
-        if (!current || estimateReviewPromptTokens(`${prompt}${analysisPromptSuffix}`) <= maxContextTokens) continue;
-
-        const truncationMarker = key === 'prDiff' ? PR_DIFF_TRUNCATION_MARKER : TRUNCATION_MARKER;
-        const fixedPrompt = buildReviewPrompt({ ...mutable, [key]: '' });
-        const fixedTokens = estimateReviewPromptTokens(`${fixedPrompt}${analysisPromptSuffix}`);
-        if (fixedTokens >= maxContextTokens) {
-            mutable[key] = key === 'prDiff' ? truncationMarker : '';
-        } else {
-            let low = 0;
-            let high = current.length;
-            while (low < high) {
-                const midpoint = Math.ceil((low + high) / 2);
-                const candidate = `${current.slice(0, midpoint)}${truncationMarker}`;
-                const candidatePrompt = buildReviewPrompt({ ...mutable, [key]: candidate });
-                if (estimateReviewPromptTokens(`${candidatePrompt}${analysisPromptSuffix}`) <= maxContextTokens) low = midpoint;
-                else high = midpoint - 1;
-            }
-            mutable[key] = low > 0
-                ? `${current.slice(0, low)}${truncationMarker}`
-                : key === 'prDiff' ? truncationMarker : '';
+    for (let attempt = 0; attempt < MAX_FIT_ATTEMPTS; attempt += 1) {
+        const selection = selectWithinBudget({ options, analysisPromptSuffix, estimator, preparedDiff }, target);
+        const prompt = buildReviewPrompt(selection.mutable);
+        estimatedTokens = estimator.estimate(`${prompt}${analysisPromptSuffix}`, { cache: false });
+        if (estimatedTokens <= maxContextTokens) {
+            return {
+                prompt,
+                estimatedTokens,
+                truncatedSections: selection.trimmedSections.map(trim => trim.section),
+                trimmedSections: selection.trimmedSections,
+                sectionTokens: selection.sectionTokens,
+                prDiffTruncated: selection.prDiffTruncated,
+                budgetOmittedFiles: selection.budgetOmittedFiles,
+                missingPatchFiles: [...(preparedDiff?.missingPatchFiles ?? [])],
+                ioGuardOmittedFiles: [...(preparedDiff?.ioGuardOmittedFiles ?? [])],
+            };
         }
-        if (key === 'prDiff') prDiffTruncated = true;
-        truncatedSections.push(label);
-        prompt = buildReviewPrompt(mutable);
+        // Every trimmable section is already gone: what remains is the
+        // mandatory instruction scaffolding plus the runtime suffix.
+        if (!selection.trimmableRemaining) break;
+        target -= estimatedTokens - maxContextTokens + SECTION_BOUNDARY_SLACK_TOKENS * TRIM_ORDER.length;
     }
 
-    const estimatedTokens = estimateReviewPromptTokens(`${prompt}${analysisPromptSuffix}`);
-    if (estimatedTokens > maxContextTokens) {
-        // Every trimmable section has already been reduced, so what remains is
-        // the mandatory instruction scaffolding plus the runtime suffix. The
-        // trimmer cannot shrink that, and returning it would hand the reviewer
-        // an oversized prompt with the diff, objective, and review request
-        // stripped out. Fail explicitly instead.
-        throw new Error(
-            `PR review token budget too small: the mandatory review instructions need at least ${estimatedTokens} tokens, `
-            + `but the configured input ceiling is ${maxContextTokens}. Raise the configured PR review context token limit.`,
-        );
-    }
-
-    return {
-        prompt,
-        estimatedTokens,
-        truncatedSections,
-        prDiffTruncated,
-    };
+    // Returning the remaining prompt would hand the reviewer an oversized
+    // request with the diff, objective, and review request stripped out.
+    throw new Error(
+        `PR review token budget too small: the mandatory review instructions need at least ${estimatedTokens} estimated tokens, `
+        + `but the configured input ceiling is ${maxContextTokens}. Raise the Review context budget percentage or remove the legacy token cap.`,
+    );
 }

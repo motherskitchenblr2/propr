@@ -8,7 +8,7 @@
  * `## Suggestions and Follow-ups` sections alongside evaluation and score.
  *
  * `reviewPromptBuilder.ts` only depends on `@propr/shared` (for the default
- * review guidance), which CI builds before running the test suite, so it can be
+ * review guidance) and pure local helpers, which CI builds before running the test suite, so it can be
  * imported directly without building the heavier `@propr/core` package.
  */
 import { test, describe } from 'node:test';
@@ -17,6 +17,7 @@ import { getEncoding } from 'js-tiktoken';
 import { buildAnalysisSafetySuffix } from '../packages/core/src/agents/impl/utils/analysisPromptSafety.js';
 
 const { buildReviewPrompt, buildReviewPromptWithinBudget } = await import('../src/jobs/reviewPromptBuilder.js');
+const { ReviewTokenEstimator } = await import('../src/jobs/reviewTokenEstimator.js');
 
 function baseOptions(overrides: Record<string, unknown> = {}) {
     return {
@@ -163,6 +164,19 @@ describe('buildReviewPrompt — mandatory output contract', () => {
         assert.ok(prompt.includes('Do not print this validation pass or turn it into a generic checklist'));
     });
 
+    test('requires a related-path completeness audit even with custom review guidance', () => {
+        for (const options of [baseOptions(), baseOptions({ reviewPromptOverride: 'Focus on correctness.' })]) {
+            const prompt = buildReviewPrompt(options);
+            assert.ok(prompt.includes('Derive the key correctness invariants'));
+            assert.ok(prompt.includes('inspect sibling implementations and callers'));
+            assert.ok(prompt.includes('without a finding-count limit or quota'));
+            assert.ok(prompt.includes('Group occurrences that share a root cause and correction'));
+            assert.ok(prompt.includes('state that limitation rather than implying exhaustive coverage'));
+            assert.ok(prompt.includes('does not expand the original review boundary'));
+            assert.ok(prompt.includes('Do not demand atomicity that independent external systems cannot provide'));
+        }
+    });
+
     test('makes blocker and merge-ready score bands mutually consistent', () => {
         const prompt = buildReviewPrompt(baseOptions());
         assert.ok(prompt.includes('**8–10:** no actionable findings and no known current-head check failure'));
@@ -211,11 +225,14 @@ describe('buildReviewPrompt — mandatory output contract', () => {
         const analysisSafetySuffix = buildAnalysisSafetySuffix('text', false, undefined);
         const result = buildReviewPromptWithinBudget(baseOptions({ relatedContext: large }), REVIEW_TOKEN_CEILING, analysisSafetySuffix);
         const fullyComposedRequest = `${result.prompt}${analysisSafetySuffix}`;
-        const conservativeFullyComposedTokens = Buffer.byteLength(fullyComposedRequest, 'utf8');
+        const tokenizedRequestLength = getEncoding('o200k_base').encode(fullyComposedRequest).length;
 
-        assert.equal(result.estimatedTokens, conservativeFullyComposedTokens);
-        assert.ok(conservativeFullyComposedTokens <= REVIEW_TOKEN_CEILING);
-        assert.ok(Buffer.byteLength(result.prompt, 'utf8') < result.estimatedTokens);
+        // The estimate covers the analysis suffix and is a calibrated token
+        // estimate, not a byte count.
+        assert.equal(result.estimatedTokens, new ReviewTokenEstimator('generic-calibrated').estimate(fullyComposedRequest));
+        assert.ok(result.estimatedTokens <= REVIEW_TOKEN_CEILING);
+        assert.ok(tokenizedRequestLength <= result.estimatedTokens);
+        assert.ok(Buffer.byteLength(fullyComposedRequest, 'utf8') > result.estimatedTokens);
     });
 
     test('conservatively caps token-dense Unicode review input', () => {
