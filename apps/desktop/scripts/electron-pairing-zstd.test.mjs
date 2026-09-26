@@ -18,11 +18,12 @@ describe('Electron pairing response compression', () => {
     setup = prepareNativeElectronTest({ allowHeadlessLinux: true });
   }, { timeout: 120_000 });
 
-  // The budget covers the probe's own bounded retries of a stalled loopback
-  // request, which each cost the client's fixed header deadline, and the
+  // The fixture budget covers the probe's 45s wait for the default session's
+  // network stack to start and its bounded retry of a stalled pairing request,
+  // which costs the client's fixed header deadline. The test budget adds the
   // runner's bounded relaunch of a worker that killed the fixture outright.
   it('negotiates and transparently decodes zstd through defaultSession.fetch', {
-    timeout: 70_000,
+    timeout: 110_000,
   }, async context => {
     if ('skipReason' in setup) {
       context.skip(setup.skipReason);
@@ -36,6 +37,11 @@ describe('Electron pairing response compression', () => {
     })));
     const received = [];
     const server = createServer((request, response) => {
+      // The probe's readiness request only proves the network stack is up.
+      if (request.url === '/ready') {
+        response.writeHead(204).end();
+        return;
+      }
       received.push({ acceptEncoding: request.headers['accept-encoding'], path: request.url });
       const body = request.url === '/decoded-over-limit'
         ? decodedOverLimit
@@ -49,6 +55,10 @@ describe('Electron pairing response compression', () => {
       });
       response.end(body);
     });
+    // The probe sends all four requests over one keep-alive connection. Closing
+    // it on the default idle timeout would race a request that a busy worker
+    // delayed, losing it for a reason that has nothing to do with zstd.
+    server.keepAliveTimeout = 0;
     await new Promise((resolveListen, rejectListen) => {
       server.once('error', rejectListen);
       server.listen(0, '127.0.0.1', resolveListen);
@@ -69,10 +79,22 @@ describe('Electron pairing response compression', () => {
         ],
         name: 'Electron zstd fixture',
         setup,
-        timeout: 30_000,
+        timeout: 80_000,
       });
 
       const evidence = JSON.stringify(report);
+      assert.equal(
+        report.readiness?.ready,
+        true,
+        `Electron's default session never reached the loopback server: ${evidence}`,
+      );
+      // 8s is the pairing client's header deadline: a start-up this slow would
+      // have failed a measured request without the readiness wait.
+      if (report.readiness.attempts > 1 || report.readiness.elapsedMs >= 8_000) {
+        context.diagnostic(
+          `default session needed ${report.readiness.attempts} requests and ${report.readiness.elapsedMs}ms to reach the loopback server`,
+        );
+      }
       for (const { acceptEncoding, path } of received) {
         assert.match(
           acceptEncoding ?? '',
@@ -105,6 +127,9 @@ describe('Electron pairing response compression', () => {
       assert.equal(report.stacked.kind, 'invalid_response', evidence);
       assert.equal(report.stacked.responseEncoding, 'zstd, gzip');
     } finally {
+      // keepAliveTimeout is disabled above, so an idle connection the probe
+      // left behind must be closed here for the server to settle.
+      server.closeAllConnections();
       await new Promise((resolveClose, rejectClose) => {
         server.close(error => error ? rejectClose(error) : resolveClose());
       });
