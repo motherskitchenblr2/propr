@@ -17,7 +17,7 @@
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "@modelcontextprotocol/server": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.3.0",
     "@propr/core": "^0.8.15",
     "@propr/local-setup": "^0.8.15",
     "@propr/shared": "^0.8.15",
